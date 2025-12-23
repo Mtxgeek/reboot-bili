@@ -342,10 +342,9 @@ class BrowserManager:
                                 if "Chrome_WidgetWin" in class_name or "Edge_WidgetWin" in class_name:
                                     # 获取窗口所属的进程ID
                                     _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                                    # 只添加我们启动的进程的窗口
-                                    if pid in our_process_ids:
-                                        found_windows.append((hwnd, class_name, pid))
-                                        logger.debug(f"找到窗口: hwnd={hwnd}, class={class_name}, pid={pid}")
+                                    # 添加所有可见的浏览器窗口，不限制进程ID
+                                    found_windows.append((hwnd, class_name, pid))
+                                    logger.debug(f"找到窗口: hwnd={hwnd}, class={class_name}, pid={pid}")
                         except Exception as e:
                             logger.debug(f"查找窗口时出错: {e}")
                     
