@@ -688,26 +688,26 @@ class BrowserManager:
         return True
     
     def open_url(self, url: str) -> Optional[str]:
-        """使用 CDP 打开新页面"""
+        """使用 subprocess 启动新浏览器窗口打开页面，确保使用新窗口而不是新标签页"""
         try:
-            encoded_url = urllib.parse.quote(url)
-            response = self.send_cdp_request("PUT", f"/json/new?{encoded_url}")
-            if response:
-                # 解析返回的 target ID
-                match = re.search(r'"id"\s*:\s*"([^"]+)"', response)
-                if match:
-                    target_id = match.group(1)
-                    logger.info(f"成功打开页面: {url} (target_id: {target_id})")
-                    return target_id
-            # 如果 PUT 请求失败，尝试 GET 请求
-            response = self.send_cdp_request("GET", f"/json/new?{encoded_url}")
-            if response:
-                match = re.search(r'"id"\s*:\s*"([^"]+)"', response)
-                if match:
-                    target_id = match.group(1)
-                    logger.info(f"成功打开页面: {url} (target_id: {target_id})")
-                    return target_id
-            return None
+            args = [
+                self.browser_path,
+                "--new-window",
+                url,
+            ]
+            
+            process = subprocess.Popen(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+            )
+            
+            self.browser_processes.append(process)
+            logger.info(f"成功打开页面: {url} (PID: {process.pid})")
+            time.sleep(START_DELAY)
+            
+            return str(process.pid)
         except Exception as e:
             logger.error(f"打开页面失败: {url}, 错误: {e}")
             return None
