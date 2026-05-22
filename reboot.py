@@ -2,6 +2,7 @@
 多开浏览器管理器 - 定时重启解决内存泄漏
 适用于5800H CPU + 32GB RAM + 2GB显存环境
 使用 Trea CN 软件开发
+参考 Java StarBotBilibiliLiveOnPlugin 的浏览器刷新逻辑
 """
 
 import os
@@ -17,6 +18,9 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import json
 import argparse
+import urllib.request
+import urllib.error
+import re
 
 # ====================== 常量定义 ======================
 # 默认配置
@@ -44,6 +48,11 @@ DEFAULT_EDGE_PATHS = [
     r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
     r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"
 ]
+
+# ====================== Chrome DevTools Protocol 配置 ======================
+DEFAULT_DEBUG_PORT = 9222
+DEBUG_PORT_LOCK = threading.Lock()
+CURRENT_DEBUG_PORT = DEFAULT_DEBUG_PORT
 
 # 创建logs文件夹（如果不存在）
 logs_dir = 'logs'
@@ -115,6 +124,16 @@ class BrowserManager:
         self.STARTUP_PROTECTION_PERIOD = 90
         # 记录最后一次启动时间
         self.last_start_time = None
+        # 记录打开的页面target ID映射
+        self.roomIdToTargetIdMap = {}
+        self.roomOpenedAtMap = {}
+        
+        # 初始化调试端口
+        global CURRENT_DEBUG_PORT
+        with DEBUG_PORT_LOCK:
+            self.debug_port = CURRENT_DEBUG_PORT
+            CURRENT_DEBUG_PORT += 1
+        logger.info(f"使用调试端口: {self.debug_port}")
         
         # 窗口配置，从参数获取
         self.window_settings = window_settings or {
@@ -260,13 +279,15 @@ class BrowserManager:
             return 1920, 1080  # 默认分辨率
     
     def create_browser_args(self, url: str) -> List[str]:
-        """创建浏览器启动参数，每个URL使用单独窗口"""
+        """创建浏览器启动参数，每个URL使用单独窗口，添加远程调试端口"""
         if not self.browser_path:
             raise FileNotFoundError("浏览器路径未找到")
         
         # 使用浏览器默认窗口大小，不强制设置
         args = [
             self.browser_path,
+            "--remote-debugging-address=127.0.0.1",
+            f"--remote-debugging-port={self.debug_port}",
             "--new-window",  # 每个URL使用新窗口打开
             url,  # 当前要打开的URL
         ]
@@ -534,15 +555,26 @@ class BrowserManager:
         return
     
     def force_restart(self, reason: str = "资源使用过高"):
-        """强制重启所有浏览器"""
-        logger.warning(f"强制重启所有浏览器 - 原因: {reason}")
-        self.stop_all_browsers()
-        time.sleep(STOP_DELAY)  # 等待完全关闭
-        self.start_all_browsers()
+        """使用 CDP 刷新浏览器页面，而不是强制 kill 进程"""
+        logger.warning(f"刷新所有浏览器页面 - 原因: {reason}")
+        
+        # 使用 CDP 刷新所有页面
+        if self.is_devtools_ready():
+            self.refresh_all_pages()
+        else:
+            # 如果 CDP 不可用，回退到强制重启
+            logger.warning("CDP 不可用，回退到强制重启")
+            self.stop_all_browsers()
+            time.sleep(STOP_DELAY)
+            self.start_all_browsers()
     
     def stop_all_browsers(self):
         """停止所有浏览器进程"""
         logger.info("正在停止所有浏览器进程...")
+        
+        # 优先使用 CDP 关闭页面
+        if self.is_devtools_ready():
+            self.close_all_pages()
         
         # 清理Chrome残留进程
         self.cleanup_chrome_processes()
@@ -550,6 +582,135 @@ class BrowserManager:
         # 清空浏览器窗口记录
         self.browser_profiles.clear()
         self.browser_processes.clear()
+        self.roomIdToTargetIdMap.clear()
+        self.roomOpenedAtMap.clear()
+    
+    def get_devtools_base_url(self):
+        """获取 DevTools 基础 URL"""
+        return f"http://127.0.0.1:{self.debug_port}"
+    
+    def send_cdp_request(self, method: str, path: str) -> Optional[str]:
+        """发送 CDP 请求"""
+        try:
+            url = f"{self.get_devtools_base_url()}{path}"
+            req = urllib.request.Request(url, method=method)
+            with urllib.request.urlopen(req, timeout=5) as response:
+                return response.read().decode('utf-8')
+        except urllib.error.URLError as e:
+            logger.debug(f"CDP 请求失败: {e}")
+            return None
+        except Exception as e:
+            logger.debug(f"CDP 请求异常: {e}")
+            return None
+    
+    def is_devtools_ready(self) -> bool:
+        """检查 DevTools 是否可用"""
+        response = self.send_cdp_request("GET", "/json/version")
+        return response is not None
+    
+    def list_page_targets(self) -> List[Dict]:
+        """列出所有页面目标"""
+        response = self.send_cdp_request("GET", "/json/list")
+        if not response:
+            return []
+        try:
+            return json.loads(response)
+        except json.JSONDecodeError:
+            return []
+    
+    def reload_target(self, target_id: str) -> bool:
+        """刷新指定的页面目标"""
+        response = self.send_cdp_request("GET", f"/json/reload/{target_id}")
+        return response is not None
+    
+    def close_target(self, target_id: str) -> bool:
+        """关闭指定的页面目标"""
+        response = self.send_cdp_request("GET", f"/json/close/{target_id}")
+        return response is not None
+    
+    def refresh_all_pages(self):
+        """刷新所有页面"""
+        targets = self.list_page_targets()
+        logger.info(f"找到 {len(targets)} 个页面目标")
+        
+        for target in targets:
+            target_id = target.get('id')
+            target_type = target.get('type')
+            target_url = target.get('url')
+            
+            if target_type == 'page' and target_id:
+                logger.info(f"刷新页面: {target_url} (target_id: {target_id})")
+                if self.reload_target(target_id):
+                    logger.info(f"成功刷新页面: {target_url}")
+                else:
+                    # 刷新失败，尝试关闭并重新打开
+                    logger.warning(f"刷新页面失败，尝试关闭并重开: {target_url}")
+                    if self.close_target(target_id):
+                        time.sleep(1)
+                        # 验证是否真的关闭了
+                        if self.is_target_closed(target_id):
+                            logger.info(f"页面已关闭: {target_url}")
+                            # 重新打开页面
+                            self.open_url(target_url)
+                        else:
+                            logger.warning(f"页面未真正关闭: {target_url}")
+                    else:
+                        logger.error(f"关闭页面失败: {target_url}")
+    
+    def close_all_pages(self):
+        """关闭所有页面"""
+        targets = self.list_page_targets()
+        logger.info(f"找到 {len(targets)} 个页面目标")
+        
+        for target in targets:
+            target_id = target.get('id')
+            target_type = target.get('type')
+            target_url = target.get('url')
+            
+            if target_type == 'page' and target_id:
+                logger.info(f"关闭页面: {target_url} (target_id: {target_id})")
+                if self.close_target(target_id):
+                    # 验证是否真的关闭了
+                    if self.is_target_closed(target_id):
+                        logger.info(f"成功关闭页面: {target_url}")
+                    else:
+                        logger.warning(f"页面未真正关闭: {target_url}")
+                else:
+                    logger.warning(f"关闭页面失败: {target_url}")
+    
+    def is_target_closed(self, target_id: str) -> bool:
+        """验证目标是否真的关闭了"""
+        time.sleep(1)  # 等待1秒让页面关闭
+        targets = self.list_page_targets()
+        for target in targets:
+            if target.get('id') == target_id:
+                return False
+        return True
+    
+    def open_url(self, url: str) -> Optional[str]:
+        """使用 CDP 打开新页面"""
+        try:
+            encoded_url = urllib.parse.quote(url)
+            response = self.send_cdp_request("PUT", f"/json/new?{encoded_url}")
+            if response:
+                # 解析返回的 target ID
+                match = re.search(r'"id"\s*:\s*"([^"]+)"', response)
+                if match:
+                    target_id = match.group(1)
+                    logger.info(f"成功打开页面: {url} (target_id: {target_id})")
+                    return target_id
+            # 如果 PUT 请求失败，尝试 GET 请求
+            response = self.send_cdp_request("GET", f"/json/new?{encoded_url}")
+            if response:
+                match = re.search(r'"id"\s*:\s*"([^"]+)"', response)
+                if match:
+                    target_id = match.group(1)
+                    logger.info(f"成功打开页面: {url} (target_id: {target_id})")
+                    return target_id
+            return None
+        except Exception as e:
+            logger.error(f"打开页面失败: {url}, 错误: {e}")
+            return None
     
     def cleanup_chrome_processes(self):
         """清理残留的浏览器进程，但只清理当前使用的浏览器类型"""
