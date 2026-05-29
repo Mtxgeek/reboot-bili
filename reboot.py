@@ -8,7 +8,6 @@
 import os
 import sys
 import time
-import signal
 import psutil
 import logging
 from logging.handlers import TimedRotatingFileHandler
@@ -20,7 +19,6 @@ import json
 import argparse
 import urllib.request
 import urllib.error
-import re
 
 # ====================== 常量定义 ======================
 # 默认配置
@@ -34,7 +32,7 @@ DEFAULT_CLEAN_CACHE = False  # 不再清理缓存，使用浏览器默认缓存
 # 监控间隔（秒）
 MONITOR_INTERVAL = 60
 SCHEDULE_CHECK_INTERVAL = 60
-START_DELAY = 3.5  # 浏览器实例启动间隔
+START_DELAY = 2  # 浏览器实例启动间隔
 STOP_DELAY = 15  # 强制重启前等待时间
 
 # Windows 浏览器配置
@@ -119,31 +117,16 @@ class BrowserManager:
         self.browser_type = browser_type  # 添加浏览器类型
         self.browser_processes = []
         self.is_running = False
-        self.browser_profiles = []
         # 浏览器启动保护期（秒），期间不进行CPU阈值检查
         self.STARTUP_PROTECTION_PERIOD = 90
         # 记录最后一次启动时间
         self.last_start_time = None
-        # 记录打开的页面target ID映射
-        self.roomIdToTargetIdMap = {}
-        self.roomOpenedAtMap = {}
-        
         # 初始化调试端口
         global CURRENT_DEBUG_PORT
         with DEBUG_PORT_LOCK:
             self.debug_port = CURRENT_DEBUG_PORT
             CURRENT_DEBUG_PORT += 1
         logger.info(f"使用调试端口: {self.debug_port}")
-        
-        # 窗口配置，从参数获取
-        self.window_settings = window_settings or {
-            'window_offset_x': 120,
-            'window_offset_y': 75
-        }
-        
-        # 提取窗口配置参数
-        self.window_offset_x = self.window_settings.get('window_offset_x', 120)
-        self.window_offset_y = self.window_settings.get('window_offset_y', 75)
         
         # 默认浏览器配置
         self.browser_configs = browser_configs or [
@@ -266,18 +249,6 @@ class BrowserManager:
         logger.error("未找到指定的浏览器路径，请确保已安装对应浏览器")
         return None
     
-    def get_screen_resolution(self):
-        """获取Windows屏幕分辨率"""
-        try:
-            import win32api
-            width = win32api.GetSystemMetrics(0)
-            height = win32api.GetSystemMetrics(1)
-            logger.info(f"检测到屏幕分辨率: {width}x{height}")
-            return width, height
-        except Exception as e:
-            logger.error(f"获取屏幕分辨率失败: {str(e)}")
-            return 1920, 1080  # 默认分辨率
-    
     def create_browser_args(self, url: str) -> List[str]:
         """创建浏览器启动参数，每个URL使用单独窗口，添加远程调试端口"""
         if not self.browser_path:
@@ -295,25 +266,20 @@ class BrowserManager:
         return args
     
     def open_urls_in_tabs(self, profile_idx: int, urls: List[str]) -> None:
-        """每个URL使用单独窗口打开，并斜着错开排布"""
+        """每个URL使用单独窗口打开，不进行位置排布"""
         try:
-            # 验证URL列表非空
             if not urls:
                 logger.warning(f"浏览器实例 {profile_idx} 的URL列表为空，跳过启动")
                 return
             
             logger.info(f"为浏览器实例 {profile_idx} 打开 {len(urls)} 个窗口...")
             
-            # 先启动所有浏览器窗口，不立即调整位置
-            started_processes = []
             for window_idx, url in enumerate(urls):
                 try:
-                    # 创建浏览器启动参数
                     args = self.create_browser_args(url)
                     
                     logger.info(f"启动浏览器窗口，打开URL: {url}")
                     
-                    # 启动浏览器进程
                     process = subprocess.Popen(
                         args,
                         stdout=subprocess.DEVNULL,
@@ -321,12 +287,9 @@ class BrowserManager:
                         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
                     )
                     
-                    started_processes.append((window_idx, process, url))
-                    # 将进程添加到browser_processes列表中，用于健康检查
                     self.browser_processes.append(process)
                     logger.info(f"浏览器窗口已启动 (PID: {process.pid})")
                     
-                    # 避免同时启动所有窗口造成资源冲击
                     time.sleep(START_DELAY)
                     
                 except FileNotFoundError as e:
@@ -334,116 +297,7 @@ class BrowserManager:
                 except Exception as e:
                     logger.error(f"打开URL {url} 失败：{str(e)}")
             
-            # 所有窗口启动后，等待并尝试查找所有窗口
-            logger.info(f"所有窗口已启动，开始查找浏览器窗口...")
-            
-            # 窗口错开排布（Windows）
-            if sys.platform == "win32":
-                try:
-                    import win32gui
-                    import win32con
-                    import win32process
-                    
-                    # 获取我们启动的进程ID列表
-                    our_process_ids = [proc.pid for _, proc, _ in started_processes]
-                    logger.info(f"我们启动的进程ID: {our_process_ids}")
-                    
-                    # 最多尝试10次，每次等待3秒，直到找到所有窗口
-                    max_attempts = 10
-                    found_windows = []
-                    
-                    def find_our_browser_windows(hwnd, extra):
-                        """只查找我们启动的浏览器窗口"""
-                        try:
-                            # 获取窗口类名
-                            class_name = win32gui.GetClassName(hwnd)
-                            
-                            # 检查是否为浏览器窗口
-                            if win32gui.IsWindowVisible(hwnd) and win32gui.IsWindowEnabled(hwnd):
-                                if "Chrome_WidgetWin" in class_name or "Edge_WidgetWin" in class_name:
-                                    # 获取窗口所属的进程ID
-                                    _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                                    # 添加所有可见的浏览器窗口，不限制进程ID
-                                    found_windows.append((hwnd, class_name, pid))
-                                    logger.debug(f"找到窗口: hwnd={hwnd}, class={class_name}, pid={pid}")
-                        except Exception as e:
-                            logger.debug(f"查找窗口时出错: {e}")
-                    
-                    # 重试机制：最多尝试10次，每次等待3秒
-                    attempt = 0
-                    required_windows = len(started_processes)
-                    
-                    while attempt < max_attempts:
-                        attempt += 1
-                        # 清空之前的结果
-                        found_windows.clear()
-                        # 查找所有浏览器窗口
-                        win32gui.EnumWindows(find_our_browser_windows, None)
-                        
-                        logger.info(f"尝试 {attempt}/{max_attempts}: 找到 {len(found_windows)} 个我们启动的浏览器窗口，需要 {required_windows} 个")
-                        
-                        # 当找到的窗口数量达到或超过需要的数量时进行调整
-                        if len(found_windows) >= required_windows:
-                            logger.info(f"找到 {len(found_windows)} 个我们启动的浏览器窗口，开始调整位置...")
-                            break
-                        else:
-                            # 等待3秒后重试
-                            logger.info(f"等待3秒后重试...")
-                            time.sleep(3)
-                    
-                    # 如果找到了足够的窗口，进行位置调整
-                    if len(found_windows) >= required_windows:
-                        # 调整前 required_windows 个窗口的位置
-                        for idx in range(required_windows):
-                            hwnd = found_windows[idx][0]
-                            # 计算窗口位置
-                            pos_x = idx * self.window_offset_x
-                            pos_y = idx * self.window_offset_y
-                            
-                            # 设置窗口位置，不改变大小，不限制在桌面范围内
-                            win32gui.SetWindowPos(
-                                hwnd,
-                                win32con.HWND_NOTOPMOST,
-                                pos_x,         # 窗口左上角X坐标
-                                pos_y,         # 窗口左上角Y坐标
-                                0,  # 不改变宽度
-                                0,  # 不改变高度
-                                win32con.SWP_SHOWWINDOW | win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE | win32con.SWP_NOSIZE  # 显示窗口，不改变大小和Z顺序，不激活
-                            )
-                            logger.info(f"已调整窗口位置: ({pos_x}, {pos_y}) (窗口句柄: {hwnd}, 进程ID: {found_windows[idx][2]})")
-                            # 记录浏览器窗口信息
-                            self.browser_profiles.append({
-                                'pid': found_windows[idx][2],  # 保存实际的进程ID
-                                'hwnd': hwnd,  # 保存窗口句柄
-                                'window_idx': idx,
-                                'profile_idx': profile_idx,
-                                'url': started_processes[idx][2],
-                                'start_time': datetime.now()
-                            })
-                    else:
-                        logger.warning(f"尝试 {max_attempts} 次后仍未找到足够的浏览器窗口，找到 {len(found_windows)} 个，需要 {required_windows} 个，跳过位置调整")
-                        logger.info(f"当前系统中所有浏览器窗口: ")
-                        # 临时查找所有浏览器窗口用于调试
-                    all_browser_windows = []
-                    def find_all_browser_windows(hwnd, extra):
-                        try:
-                            if win32gui.IsWindowVisible(hwnd):
-                                class_name = win32gui.GetClassName(hwnd)
-                                if "Chrome_WidgetWin" in class_name or "Edge_WidgetWin" in class_name:
-                                    _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                                    title = win32gui.GetWindowText(hwnd)
-                                    all_browser_windows.append((hwnd, class_name, pid, title))
-                        except:
-                            pass
-                    win32gui.EnumWindows(find_all_browser_windows, None)
-                    for hwnd, class_name, pid, title in all_browser_windows:
-                        logger.info(f"  hwnd={hwnd}, class={class_name}, pid={pid}, title={title[:30]}...")
-                
-                except ImportError as e:
-                    logger.warning(f"无法导入win32gui模块，跳过窗口位置调整: {str(e)}")
-                except Exception as e:
-                    logger.error(f"调整窗口位置失败: {str(e)}")
-                    logger.exception("窗口调整错误堆栈:")
+            logger.info(f"所有窗口已启动")
             
         except Exception as e:
             logger.error(f"处理浏览器实例 {profile_idx} 时出错：{str(e)}")
@@ -579,11 +433,8 @@ class BrowserManager:
         # 清理Chrome残留进程
         self.cleanup_chrome_processes()
         
-        # 清空浏览器窗口记录
-        self.browser_profiles.clear()
+        # 清空浏览器进程记录
         self.browser_processes.clear()
-        self.roomIdToTargetIdMap.clear()
-        self.roomOpenedAtMap.clear()
     
     def get_devtools_base_url(self):
         """获取 DevTools 基础 URL"""
@@ -629,9 +480,10 @@ class BrowserManager:
         return response is not None
     
     def refresh_all_pages(self):
-        """刷新所有页面"""
+        """直接关闭并重新打开所有页面，然后排布窗口"""
         targets = self.list_page_targets()
-        logger.info(f"找到 {len(targets)} 个页面目标")
+        page_count = sum(1 for t in targets if t.get('type') == 'page')
+        logger.info(f"找到 {len(targets)} 个页面目标，其中 {page_count} 个页面")
         
         for target in targets:
             target_id = target.get('id')
@@ -639,23 +491,21 @@ class BrowserManager:
             target_url = target.get('url')
             
             if target_type == 'page' and target_id:
-                logger.info(f"刷新页面: {target_url} (target_id: {target_id})")
-                if self.reload_target(target_id):
-                    logger.info(f"成功刷新页面: {target_url}")
-                else:
-                    # 刷新失败，尝试关闭并重新打开
-                    logger.warning(f"刷新页面失败，尝试关闭并重开: {target_url}")
-                    if self.close_target(target_id):
-                        time.sleep(1)
-                        # 验证是否真的关闭了
-                        if self.is_target_closed(target_id):
-                            logger.info(f"页面已关闭: {target_url}")
-                            # 重新打开页面
-                            self.open_url(target_url)
-                        else:
-                            logger.warning(f"页面未真正关闭: {target_url}")
+                logger.info(f"关闭并重开页面: {target_url} (target_id: {target_id})")
+                if self.close_target(target_id):
+                    time.sleep(1)
+                    if self.is_target_closed(target_id):
+                        logger.info(f"页面已关闭: {target_url}")
+                        self.open_url(target_url)
                     else:
-                        logger.error(f"关闭页面失败: {target_url}")
+                        logger.warning(f"页面未真正关闭: {target_url}")
+                else:
+                    logger.error(f"关闭页面失败: {target_url}")
+        
+        if page_count > 0:
+            time.sleep(5)
+            logger.info(f"所有页面已重新打开，开始排布窗口...")
+            self.arrange_windows(page_count)
     
     def close_all_pages(self):
         """关闭所有页面"""
@@ -692,6 +542,8 @@ class BrowserManager:
         try:
             args = [
                 self.browser_path,
+                "--remote-debugging-address=127.0.0.1",
+                f"--remote-debugging-port={self.debug_port}",
                 "--new-window",
                 url,
             ]
@@ -711,6 +563,121 @@ class BrowserManager:
         except Exception as e:
             logger.error(f"打开页面失败: {url}, 错误: {e}")
             return None
+    
+    def arrange_windows(self, required_windows: int = 0):
+        """随机选择一个浏览器窗口固定到左上角，剩余窗口由Windows自动排布"""
+        if sys.platform != "win32":
+            logger.info(f"[窗口排布] 当前系统非Windows，跳过窗口排布")
+            return
+        
+        try:
+            import win32gui
+            import win32con
+            import win32process
+            import random
+            
+            max_attempts = 10
+            found_windows = []
+            
+            def find_browser_windows(hwnd, extra):
+                try:
+                    if win32gui.IsWindowVisible(hwnd) and win32gui.IsWindowEnabled(hwnd):
+                        class_name = win32gui.GetClassName(hwnd)
+                        window_title = win32gui.GetWindowText(hwnd)
+                        if "Chrome_WidgetWin" in class_name or "Edge_WidgetWin" in class_name:
+                            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                            found_windows.append((hwnd, class_name, pid, window_title))
+                except Exception as e:
+                    logger.debug(f"查找窗口时出错: {e}")
+            
+            logger.info(f"[窗口排布] 开始查找浏览器窗口，最多尝试 {max_attempts} 次")
+            logger.info(f"[窗口排布] 当前记录的浏览器进程数: {len(self.browser_processes)}")
+            our_pids = [proc.pid for proc in self.browser_processes if hasattr(proc, 'pid')]
+            logger.info(f"[窗口排布] 我们启动的进程ID列表: {our_pids}")
+            
+            def find_our_browser_windows(hwnd, extra):
+                try:
+                    if win32gui.IsWindowVisible(hwnd) and win32gui.IsWindowEnabled(hwnd):
+                        class_name = win32gui.GetClassName(hwnd)
+                        window_title = win32gui.GetWindowText(hwnd)
+                        if "Chrome_WidgetWin" in class_name or "Edge_WidgetWin" in class_name:
+                            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                            if pid in our_pids:
+                                found_windows.append((hwnd, class_name, pid, window_title))
+                                logger.debug(f"[窗口排布] 匹配窗口: hwnd={hwnd}, pid={pid}, title={window_title[:30]}...")
+                            else:
+                                logger.debug(f"[窗口排布] 跳过不属于我们的窗口: hwnd={hwnd}, pid={pid}, title={window_title[:30]}...")
+                except Exception as e:
+                    logger.debug(f"查找窗口时出错: {e}")
+            
+            attempt = 0
+            while attempt < max_attempts:
+                attempt += 1
+                found_windows.clear()
+                win32gui.EnumWindows(find_our_browser_windows, None)
+                
+                logger.info(f"[窗口排布] 尝试 {attempt}/{max_attempts}: 找到 {len(found_windows)} 个属于我们的浏览器窗口")
+                
+                if len(found_windows) > 0:
+                    break
+                
+                time.sleep(2)
+            
+            if len(found_windows) > 0:
+                logger.info(f"[窗口排布] ======== 找到的浏览器窗口列表 ========")
+                for idx, (hwnd, class_name, pid, title) in enumerate(found_windows):
+                    logger.info(f"[窗口排布] 窗口 {idx + 1}: hwnd={hwnd}, class={class_name}, pid={pid}, title={title[:50]}...")
+                logger.info(f"[窗口排布] =======================================")
+                
+                target_idx = random.randint(0, len(found_windows) - 1)
+                selected_window = found_windows[target_idx]
+                hwnd = selected_window[0]
+                class_name = selected_window[1]
+                pid = selected_window[2]
+                window_title = selected_window[3]
+                pos_x = 0
+                pos_y = 0
+                
+                logger.info(f"[窗口排布] 随机选择第 {target_idx + 1} 个窗口 (hwnd={hwnd}, pid={pid}, title={window_title[:30]}...)")
+                logger.info(f"[窗口排布] 将窗口移动到左上角: ({pos_x}, {pos_y})")
+                
+                win32gui.SetWindowPos(
+                    hwnd,
+                    win32con.HWND_TOPMOST,
+                    pos_x,
+                    pos_y,
+                    0,
+                    0,
+                    win32con.SWP_SHOWWINDOW | win32con.SWP_NOSIZE
+                )
+                
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                
+                try:
+                    win32gui.SetForegroundWindow(hwnd)
+                    win32gui.SetActiveWindow(hwnd)
+                    logger.info(f"[窗口排布] 窗口已移动到左上角、置于顶层并激活")
+                except Exception as e:
+                    logger.warning(f"[窗口排布] 窗口激活失败（Windows安全限制）: {str(e)}")
+                    logger.info(f"[窗口排布] 窗口已移动到左上角并置于顶层")
+                logger.info(f"[窗口排布] 窗口移动完成，验证窗口是否仍然存在...")
+                if win32gui.IsWindow(hwnd):
+                    logger.info(f"[窗口排布] 窗口 {hwnd} 移动后仍然存在")
+                else:
+                    logger.error(f"[窗口排布] 窗口 {hwnd} 移动后不存在了！")
+                
+                logger.info(f"[窗口排布] 再次检查浏览器窗口总数...")
+                found_windows.clear()
+                win32gui.EnumWindows(find_browser_windows, None)
+                logger.info(f"[窗口排布] 移动后剩余 {len(found_windows)} 个浏览器窗口")
+            else:
+                logger.warning(f"[窗口排布] 未找到浏览器窗口，跳过位置调整")
+                
+        except ImportError as e:
+            logger.warning(f"[窗口排布] 无法导入win32gui模块，跳过窗口位置调整: {str(e)}")
+        except Exception as e:
+            logger.error(f"[窗口排布] 调整窗口位置失败: {str(e)}")
+            logger.exception("[窗口排布] 窗口调整错误堆栈:")
     
     def cleanup_chrome_processes(self):
         """清理残留的浏览器进程，但只清理当前使用的浏览器类型"""
@@ -770,20 +737,14 @@ class BrowserManager:
         except Exception as e:
             logger.error(f"清理浏览器进程时出错: {str(e)}")
     
-    def cleanup_cache(self):
-        """清理浏览器缓存目录（已废弃，使用浏览器默认缓存）"""
-        # 不再清理浏览器缓存，使用浏览器默认的缓存管理
-        logger.info("已废弃：不再清理浏览器缓存，使用浏览器默认缓存")
-    
     def start_all_browsers(self):
         """启动所有配置的浏览器实例"""
         logger.info(f"启动 {len(self.browser_configs)} 个浏览器实例...")
         # 记录浏览器启动时间
         self.last_start_time = datetime.now()
         
-        # 清空之前的进程列表和窗口记录
+        # 清空之前的进程列表
         self.browser_processes.clear()
-        self.browser_profiles.clear()
         
         for idx, config in enumerate(self.browser_configs):
             logger.info(f"打开 {config['name']}: {config['urls']}")
