@@ -19,6 +19,7 @@ import json
 import argparse
 import urllib.request
 import urllib.error
+import re
 
 # ====================== 常量定义 ======================
 # 默认配置
@@ -60,15 +61,15 @@ os.makedirs(logs_dir, exist_ok=True)
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# 创建文件处理器，按天分割日志，使用年月日格式命名
+# 创建文件处理器，按天分割日志，文件名格式为 YYYY-MM-DD.log
 file_handler = TimedRotatingFileHandler(
     filename=os.path.join(logs_dir, datetime.now().strftime('%Y-%m-%d') + '.log'),
     when='midnight',  # 每天午夜分割
     interval=1,  # 每天分割一次
-    backupCount=7,  # 保留7天的日志文件
+    backupCount=7,  # 保留7天的备份日志文件
     encoding='utf-8'
 )
-# 设置文件名后缀格式，备份文件格式为：年月日.log.%Y-%m-%d
+# 设置文件名后缀格式
 file_handler.suffix = '%Y-%m-%d'
 file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 
@@ -121,6 +122,9 @@ class BrowserManager:
         self.STARTUP_PROTECTION_PERIOD = 90
         # 记录最后一次启动时间
         self.last_start_time = None
+        # 启动锁，防止重复启动
+        self.startup_lock = threading.Lock()
+        self.is_starting = False
         # 初始化调试端口
         global CURRENT_DEBUG_PORT
         with DEBUG_PORT_LOCK:
@@ -335,7 +339,8 @@ class BrowserManager:
                 self.check_browser_processes()
                 
                 # 健康检查：如果浏览器进程全部退出，重新启动
-                if not self.browser_processes and self.browser_configs:
+                # 检查 is_starting 标志，防止重复启动
+                if not self.browser_processes and self.browser_configs and not self.is_starting:
                     logger.warning("所有浏览器进程已退出，准备重新启动...")
                     # 先确保完全停止所有进程（包括残留）
                     self.stop_all_browsers()
@@ -423,7 +428,7 @@ class BrowserManager:
             self.start_all_browsers()
     
     def stop_all_browsers(self):
-        """停止所有浏览器进程"""
+        """停止所有浏览器进程，确保进程完全退出"""
         logger.info("正在停止所有浏览器进程...")
         
         # 优先使用 CDP 关闭页面
@@ -433,8 +438,53 @@ class BrowserManager:
         # 清理Chrome残留进程
         self.cleanup_chrome_processes()
         
+        # 等待进程完全退出
+        self.wait_for_process_exit()
+        
         # 清空浏览器进程记录
         self.browser_processes.clear()
+    
+    def wait_for_process_exit(self):
+        """等待浏览器进程完全退出"""
+        max_wait_seconds = 15
+        check_interval = 2
+        elapsed = 0
+        
+        while elapsed < max_wait_seconds:
+            browser_running = self.is_browser_process_running()
+            if not browser_running:
+                logger.info("所有浏览器进程已退出")
+                return
+            logger.info(f"等待浏览器进程退出... ({elapsed}/{max_wait_seconds}秒)")
+            time.sleep(check_interval)
+            elapsed += check_interval
+        
+        logger.warning(f"等待 {max_wait_seconds} 秒后仍有浏览器进程，强制继续")
+    
+    def is_browser_process_running(self):
+        """检查是否有浏览器进程在运行"""
+        if not self.browser_path:
+            return False
+        
+        browser_path_lower = self.browser_path.lower()
+        try:
+            for proc in psutil.process_iter(['pid', 'name', 'exe']):
+                try:
+                    name = proc.info['name'] or ''
+                    exe = proc.info['exe'] or ''
+                    
+                    if 'chrome' in browser_path_lower:
+                        if ('chrome.exe' in name.lower()) and ('chrome' in exe.lower()):
+                            return True
+                    elif 'msedge' in browser_path_lower:
+                        if ('msedge.exe' in name.lower()) and ('msedge' in exe.lower()):
+                            return True
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        except Exception as e:
+            logger.error(f"检查浏览器进程时出错: {str(e)}")
+        
+        return False
     
     def get_devtools_base_url(self):
         """获取 DevTools 基础 URL"""
@@ -738,21 +788,31 @@ class BrowserManager:
             logger.error(f"清理浏览器进程时出错: {str(e)}")
     
     def start_all_browsers(self):
-        """启动所有配置的浏览器实例"""
-        logger.info(f"启动 {len(self.browser_configs)} 个浏览器实例...")
-        # 记录浏览器启动时间
-        self.last_start_time = datetime.now()
-        
-        # 清空之前的进程列表
-        self.browser_processes.clear()
-        
-        for idx, config in enumerate(self.browser_configs):
-            logger.info(f"打开 {config['name']}: {config['urls']}")
-            # 每个URL使用单独窗口打开
-            self.open_urls_in_tabs(idx + 1, config['urls'])
+        """启动所有配置的浏览器实例，使用启动锁防止重复启动"""
+        # 使用启动锁防止重复启动
+        with self.startup_lock:
+            if self.is_starting:
+                logger.warning("浏览器正在启动中，跳过重复启动")
+                return
+            self.is_starting = True
             
-            # 避免同时启动所有实例造成资源冲击
-            time.sleep(START_DELAY)  # 实例间启动间隔
+            try:
+                logger.info(f"启动 {len(self.browser_configs)} 个浏览器实例...")
+                # 记录浏览器启动时间
+                self.last_start_time = datetime.now()
+                
+                # 清空之前的进程列表
+                self.browser_processes.clear()
+                
+                for idx, config in enumerate(self.browser_configs):
+                    logger.info(f"打开 {config['name']}: {config['urls']}")
+                    # 每个URL使用单独窗口打开
+                    self.open_urls_in_tabs(idx + 1, config['urls'])
+                    
+                    # 避免同时启动所有实例造成资源冲击
+                    time.sleep(START_DELAY)  # 实例间启动间隔
+            finally:
+                self.is_starting = False
     
     def scheduled_restart(self):
         """定时重启任务"""
