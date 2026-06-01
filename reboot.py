@@ -1,10 +1,3 @@
-"""
-多开浏览器管理器 - 定时重启解决内存泄漏
-适用于5800H CPU + 32GB RAM + 2GB显存环境
-使用 Trea CN 软件开发
-参考 Java StarBotBilibiliLiveOnPlugin 的浏览器刷新逻辑
-"""
-
 import os
 import sys
 import time
@@ -19,7 +12,6 @@ import json
 import argparse
 import urllib.request
 import urllib.error
-import re
 
 # ====================== 常量定义 ======================
 # 默认配置
@@ -93,7 +85,6 @@ class BrowserManager:
                  monitor_interval: int = DEFAULT_MONITOR_INTERVAL,
                  clean_cache_on_exit: bool = DEFAULT_CLEAN_CACHE,
                  custom_browser_path: Optional[str] = None,
-                 window_settings: Optional[Dict] = None,
                  browser_type: int = 0):
         """
         初始化浏览器管理器
@@ -106,7 +97,6 @@ class BrowserManager:
             monitor_interval: 资源监控间隔（秒）
             clean_cache_on_exit: 是否在退出时清理缓存
             custom_browser_path: 自定义浏览器路径
-            window_settings: 窗口配置
             browser_type: 浏览器类型选择（0:自动检测, 1:Edge, 2:Chrome, 3:QQ浏览器）
         """
         self.restart_seconds = restart_seconds
@@ -888,7 +878,6 @@ def main():
     custom_browser_path = args.browser_path
     browser_type = 0  # 默认自动检测
     browser_configs = None
-    window_settings = None
     
     # 如果配置文件不存在，创建默认配置文件
     if not os.path.exists(args.config):
@@ -910,10 +899,6 @@ def main():
                     ]
                 }
             ],
-            "browser_settings": {
-                "window_offset_x": 120,
-                "window_offset_y": 75
-            },
             "browser_type": 0
         }
         try:
@@ -950,11 +935,7 @@ def main():
                 custom_browser_path = config.get('browser_path', custom_browser_path)
                 browser_type = config.get('browser_type', 0)
                 browser_configs = config.get('browsers', browser_configs)
-                # 从配置文件读取窗口设置
-                window_settings = config.get('browser_settings', None)
             logger.info(f"已加载配置文件: {args.config}")
-            if window_settings:
-                logger.info(f"已加载窗口配置: {window_settings}")
         except json.JSONDecodeError as e:
             logger.error(f"配置文件格式错误（JSON解析失败）: {str(e)}")
         except PermissionError as e:
@@ -990,7 +971,6 @@ def main():
         monitor_interval=monitor_interval,
         clean_cache_on_exit=clean_cache_on_exit,
         custom_browser_path=custom_browser_path,
-        window_settings=window_settings,
         browser_type=browser_type
     )
     
