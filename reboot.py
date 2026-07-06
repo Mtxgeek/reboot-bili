@@ -1,3 +1,10 @@
+"""
+多开浏览器管理器 - 定时重启解决内存泄漏
+适用于5800H CPU + 32GB RAM + 2GB显存环境
+使用 Trea CN 软件开发
+参考 Java StarBotBilibiliLiveOnPlugin 的浏览器刷新逻辑
+"""
+
 import os
 import sys
 import time
@@ -12,6 +19,7 @@ import json
 import argparse
 import urllib.request
 import urllib.error
+import urllib.parse
 
 # ====================== 常量定义 ======================
 # 默认配置
@@ -243,24 +251,61 @@ class BrowserManager:
         logger.error("未找到指定的浏览器路径，请确保已安装对应浏览器")
         return None
     
+    def get_default_user_data_dir(self) -> Optional[str]:
+        """获取浏览器默认用户数据目录，确保使用现有账户的cookie"""
+        try:
+            appdata_local = os.environ.get('LOCALAPPDATA', '')
+            if 'chrome' in self.browser_path.lower():
+                return os.path.join(appdata_local, 'Google', 'Chrome', 'User Data')
+            elif 'edge' in self.browser_path.lower():
+                return os.path.join(appdata_local, 'Microsoft', 'Edge', 'User Data')
+        except Exception as e:
+            logger.warning(f"获取默认用户数据目录失败: {str(e)}")
+        return None
+
     def create_browser_args(self, url: str) -> List[str]:
-        """创建浏览器启动参数，每个URL使用单独窗口，添加远程调试端口"""
+        """创建浏览器启动参数，使用默认用户数据目录保留cookie，添加远程调试端口"""
         if not self.browser_path:
             raise FileNotFoundError("浏览器路径未找到")
         
-        # 使用浏览器默认窗口大小，不强制设置
+        is_chrome = 'chrome' in self.browser_path.lower()
+        
         args = [
             self.browser_path,
             "--remote-debugging-address=127.0.0.1",
             f"--remote-debugging-port={self.debug_port}",
-            "--new-window",  # 每个URL使用新窗口打开
-            url,  # 当前要打开的URL
         ]
+        
+        user_data_dir = self.get_default_user_data_dir()
+        if user_data_dir:
+            args.append(f"--user-data-dir={user_data_dir}")
+            args.append("--profile-directory=Default")
+        
+        args.extend([
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-gpu",
+            "--disable-software-rasterizer",
+            "--disable-extensions",
+            "--disable-plugins",
+            "--disable-popup-blocking",
+        ])
+        
+        if is_chrome:
+            args.extend([
+                "--enable-automation",
+                "--disable-infobars",
+                "--disable-site-isolation-trials",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-blink-features=AutomationControlled",
+            ])
+        
+        args.append(url)
         
         return args
     
     def open_urls_in_tabs(self, profile_idx: int, urls: List[str]) -> None:
-        """每个URL使用单独窗口打开，不进行位置排布"""
+        """启动浏览器并通过CDP打开多个URL，先打开about:blank等待CDP就绪"""
         try:
             if not urls:
                 logger.warning(f"浏览器实例 {profile_idx} 的URL列表为空，跳过启动")
@@ -268,28 +313,49 @@ class BrowserManager:
             
             logger.info(f"为浏览器实例 {profile_idx} 打开 {len(urls)} 个窗口...")
             
-            for window_idx, url in enumerate(urls):
-                try:
-                    args = self.create_browser_args(url)
-                    
-                    logger.info(f"启动浏览器窗口，打开URL: {url}")
-                    
-                    process = subprocess.Popen(
-                        args,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
-                    )
-                    
-                    self.browser_processes.append(process)
-                    logger.info(f"浏览器窗口已启动 (PID: {process.pid})")
-                    
-                    time.sleep(START_DELAY)
-                    
-                except FileNotFoundError as e:
-                    logger.error(f"打开URL {url} 失败：浏览器路径不存在 - {str(e)}")
-                except Exception as e:
-                    logger.error(f"打开URL {url} 失败：{str(e)}")
+            args = self.create_browser_args("about:blank")
+            
+            logger.info("启动浏览器窗口，先打开about:blank等待CDP就绪...")
+            
+            process = subprocess.Popen(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+            )
+            
+            self.browser_processes.append(process)
+            logger.info(f"浏览器窗口已启动 (PID: {process.pid})")
+            
+            logger.info("等待CDP就绪...")
+            if self.is_devtools_ready(max_retries=30, retry_delay=1.0):
+                logger.info("CDP就绪，开始通过CDP打开配置的URL")
+                
+                for url in urls:
+                    try:
+                        response = self.send_cdp_request("GET", f"/json/new?{urllib.parse.quote(url, safe='')}")
+                        if response:
+                            logger.info(f"通过CDP打开URL成功: {url}")
+                        else:
+                            logger.warning(f"通过CDP打开URL失败: {url}")
+                    except Exception as e:
+                        logger.warning(f"CDP打开URL出错: {url} - {str(e)}")
+            else:
+                logger.warning("CDP不可用，回退到subprocess方式打开URL")
+                for url in urls:
+                    try:
+                        args = self.create_browser_args(url)
+                        process = subprocess.Popen(
+                            args,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+                        )
+                        self.browser_processes.append(process)
+                        logger.info(f"通过subprocess打开URL: {url} (PID: {process.pid})")
+                        time.sleep(START_DELAY)
+                    except Exception as e:
+                        logger.error(f"打开URL {url} 失败：{str(e)}")
             
             logger.info(f"所有窗口已启动")
             
@@ -333,7 +399,7 @@ class BrowserManager:
                 if not self.browser_processes and self.browser_configs and not self.is_starting:
                     logger.warning("所有浏览器进程已退出，准备重新启动...")
                     # 先确保完全停止所有进程（包括残留）
-                    self.stop_all_browsers()
+                    self.stop_all_browsers(cleanup_residual=True)
                     # 等待短暂时间，确保资源完全释放
                     time.sleep(5)
                     # 再重新启动
@@ -407,32 +473,84 @@ class BrowserManager:
         """使用 CDP 刷新浏览器页面，而不是强制 kill 进程"""
         logger.warning(f"刷新所有浏览器页面 - 原因: {reason}")
         
-        # 使用 CDP 刷新所有页面
-        if self.is_devtools_ready():
-            self.refresh_all_pages()
-        else:
-            # 如果 CDP 不可用，回退到强制重启
-            logger.warning("CDP 不可用，回退到强制重启")
-            self.stop_all_browsers()
-            time.sleep(STOP_DELAY)
-            self.start_all_browsers()
+        # 使用启动锁防止重复启动
+        with self.startup_lock:
+            if self.is_starting:
+                logger.warning("浏览器正在启动中，跳过重复重启")
+                return
+            self.is_starting = True
+            
+            try:
+                # 使用 CDP 刷新所有页面
+                if self.is_devtools_ready():
+                    self.refresh_all_pages()
+                else:
+                    # 如果 CDP 不可用，回退到强制重启
+                    logger.warning("CDP 不可用，回退到强制重启")
+                    try:
+                        self.stop_all_browsers(cleanup_residual=True)
+                    except Exception as e:
+                        logger.error(f"停止浏览器进程失败，继续尝试启动: {str(e)}")
+                    time.sleep(STOP_DELAY)
+                    try:
+                        self._start_browsers_internal()
+                    except Exception as e:
+                        logger.error(f"启动浏览器进程失败: {str(e)}")
+                        logger.exception("启动浏览器错误堆栈:")
+            finally:
+                self.is_starting = False
     
-    def stop_all_browsers(self):
-        """停止所有浏览器进程，确保进程完全退出"""
+    def restart_with_configured_urls(self):
+        """按照配置的URL数量重新启动浏览器，确保窗口数量与配置一致"""
+        logger.info("按照配置的URL数量重新启动浏览器...")
+        # 停止所有浏览器进程（包括残留）
+        self.stop_all_browsers(cleanup_residual=True)
+        # 等待进程完全退出
+        time.sleep(STOP_DELAY)
+        # 按照配置的URL数量重新启动
+        self.start_all_browsers()
+    
+    def stop_all_browsers(self, cleanup_residual: bool = False):
+        """停止所有浏览器进程，确保进程完全退出
+        
+        Args:
+            cleanup_residual: 是否清理残留的浏览器进程，默认False表示不清理
+        """
         logger.info("正在停止所有浏览器进程...")
         
-        # 优先使用 CDP 关闭页面
-        if self.is_devtools_ready():
-            self.close_all_pages()
-        
-        # 清理Chrome残留进程
-        self.cleanup_chrome_processes()
-        
-        # 等待进程完全退出
-        self.wait_for_process_exit()
-        
-        # 清空浏览器进程记录
-        self.browser_processes.clear()
+        try:
+            # 尝试使用 CDP 优雅关闭页面（使用静默模式，避免产生警告日志）
+            try:
+                if self.is_devtools_ready(silent=True):
+                    self.close_all_pages()
+                    logger.debug("已通过CDP关闭所有页面")
+            except Exception as e:
+                # 静默失败，直接使用进程终止方式，不记录警告日志
+                logger.debug(f"CDP关闭页面失败，使用进程终止方式: {str(e)}")
+            
+            # 根据参数决定是否清理残留进程
+            if cleanup_residual:
+                # 清理浏览器残留进程
+                try:
+                    self.cleanup_chrome_processes()
+                except Exception as e:
+                    logger.warning(f"清理浏览器进程时发生错误，继续执行: {str(e)}")
+                
+                # 等待进程完全退出
+                try:
+                    self.wait_for_process_exit()
+                except Exception as e:
+                    logger.warning(f"等待进程退出时发生错误，继续执行: {str(e)}")
+            
+            # 清空浏览器进程记录
+            self.browser_processes.clear()
+            
+            logger.info("停止所有浏览器进程完成")
+        except Exception as e:
+            logger.error(f"停止浏览器进程时发生错误: {str(e)}")
+            logger.exception("停止浏览器进程错误堆栈:")
+            # 即使发生错误，也要清空进程记录，确保可以重新启动
+            self.browser_processes.clear()
     
     def wait_for_process_exit(self):
         """等待浏览器进程完全退出"""
@@ -494,10 +612,46 @@ class BrowserManager:
             logger.debug(f"CDP 请求异常: {e}")
             return None
     
-    def is_devtools_ready(self) -> bool:
-        """检查 DevTools 是否可用"""
-        response = self.send_cdp_request("GET", "/json/version")
-        return response is not None
+    def is_devtools_ready(self, max_retries: int = 3, retry_delay: float = 1.0, silent: bool = False) -> bool:
+        """检查 DevTools 是否可用，支持重试机制
+        
+        Args:
+            max_retries: 最大重试次数
+            retry_delay: 重试间隔（秒）
+            silent: 是否静默模式（不记录警告日志）
+            
+        Returns:
+            True if DevTools is ready, False otherwise
+        """
+        for attempt in range(max_retries):
+            response = self.send_cdp_request("GET", "/json/version")
+            if response is not None:
+                if attempt > 0 and not silent:
+                    logger.info(f"CDP 连接成功（第 {attempt + 1} 次尝试）")
+                return True
+            logger.debug(f"CDP 连接失败，第 {attempt + 1}/{max_retries} 次尝试")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+        
+        if not silent:
+            logger.warning(f"CDP 连接失败，已尝试 {max_retries} 次，端口: {self.debug_port}")
+            # 检查端口是否被占用
+            self._check_port_status()
+        return False
+    
+    def _check_port_status(self):
+        """检查调试端口状态，帮助诊断CDP失败原因"""
+        try:
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            result = sock.connect_ex(('127.0.0.1', self.debug_port))
+            if result == 0:
+                logger.warning(f"端口 {self.debug_port} 已被占用，但CDP不可用")
+            else:
+                logger.warning(f"端口 {self.debug_port} 未被监听")
+            sock.close()
+        except Exception as e:
+            logger.error(f"检查端口状态失败: {str(e)}")
     
     def list_page_targets(self) -> List[Dict]:
         """列出所有页面目标"""
@@ -520,32 +674,50 @@ class BrowserManager:
         return response is not None
     
     def refresh_all_pages(self):
-        """直接关闭并重新打开所有页面，然后排布窗口"""
+        """按照配置的URL数量重新加载浏览器，确保窗口数量与配置一致"""
         targets = self.list_page_targets()
         page_count = sum(1 for t in targets if t.get('type') == 'page')
         logger.info(f"找到 {len(targets)} 个页面目标，其中 {page_count} 个页面")
         
+        # 先关闭所有现有页面（排除浏览器默认标签页，避免关闭后浏览器重启时自动打开）
         for target in targets:
             target_id = target.get('id')
             target_type = target.get('type')
             target_url = target.get('url')
             
             if target_type == 'page' and target_id:
-                logger.info(f"关闭并重开页面: {target_url} (target_id: {target_id})")
+                # 跳过浏览器默认的newtab页面，让浏览器自己管理
+                if target_url and (target_url.startswith('edge://newtab') or target_url.startswith('chrome://newtab')):
+                    logger.info(f"跳过浏览器默认标签页: {target_url}")
+                    continue
+                    
+                logger.info(f"关闭页面: {target_url} (target_id: {target_id})")
                 if self.close_target(target_id):
-                    time.sleep(1)
+                    time.sleep(0.5)
                     if self.is_target_closed(target_id):
                         logger.info(f"页面已关闭: {target_url}")
-                        self.open_url(target_url)
                     else:
                         logger.warning(f"页面未真正关闭: {target_url}")
                 else:
-                    logger.error(f"关闭页面失败: {target_url}")
+                    logger.warning(f"关闭页面失败: {target_url}")
         
-        if page_count > 0:
-            time.sleep(5)
-            logger.info(f"所有页面已重新打开，开始排布窗口...")
-            self.arrange_windows(page_count)
+        # 等待页面关闭
+        time.sleep(1)
+        
+        # 按照配置的URL数量重新打开，而不是按现有窗口数量
+        logger.info(f"按照配置重新打开 {len(self.browser_configs)} 个浏览器实例...")
+        for idx, config in enumerate(self.browser_configs):
+            urls = config.get('urls', [])
+            logger.info(f"打开 {config['name']}: {len(urls)} 个URL")
+            for url in urls:
+                logger.info(f"打开URL: {url}")
+                self.open_url(url)
+                time.sleep(START_DELAY)
+        
+        # 计算配置的总URL数量
+        total_urls = sum(len(config.get('urls', [])) for config in self.browser_configs)
+        if total_urls > 0:
+            logger.info(f"所有页面已重新打开")
     
     def close_all_pages(self):
         """关闭所有页面"""
@@ -585,8 +757,18 @@ class BrowserManager:
                 "--remote-debugging-address=127.0.0.1",
                 f"--remote-debugging-port={self.debug_port}",
                 "--new-window",
-                url,
             ]
+            
+            # Chrome需要额外的参数来启用CDP
+            if 'chrome' in self.browser_path.lower():
+                args.extend([
+                    "--enable-automation",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-infobars",
+                ])
+            
+            args.append(url)
             
             process = subprocess.Popen(
                 args,
@@ -603,121 +785,6 @@ class BrowserManager:
         except Exception as e:
             logger.error(f"打开页面失败: {url}, 错误: {e}")
             return None
-    
-    def arrange_windows(self, required_windows: int = 0):
-        """随机选择一个浏览器窗口固定到左上角，剩余窗口由Windows自动排布"""
-        if sys.platform != "win32":
-            logger.info(f"[窗口排布] 当前系统非Windows，跳过窗口排布")
-            return
-        
-        try:
-            import win32gui
-            import win32con
-            import win32process
-            import random
-            
-            max_attempts = 10
-            found_windows = []
-            
-            def find_browser_windows(hwnd, extra):
-                try:
-                    if win32gui.IsWindowVisible(hwnd) and win32gui.IsWindowEnabled(hwnd):
-                        class_name = win32gui.GetClassName(hwnd)
-                        window_title = win32gui.GetWindowText(hwnd)
-                        if "Chrome_WidgetWin" in class_name or "Edge_WidgetWin" in class_name:
-                            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                            found_windows.append((hwnd, class_name, pid, window_title))
-                except Exception as e:
-                    logger.debug(f"查找窗口时出错: {e}")
-            
-            logger.info(f"[窗口排布] 开始查找浏览器窗口，最多尝试 {max_attempts} 次")
-            logger.info(f"[窗口排布] 当前记录的浏览器进程数: {len(self.browser_processes)}")
-            our_pids = [proc.pid for proc in self.browser_processes if hasattr(proc, 'pid')]
-            logger.info(f"[窗口排布] 我们启动的进程ID列表: {our_pids}")
-            
-            def find_our_browser_windows(hwnd, extra):
-                try:
-                    if win32gui.IsWindowVisible(hwnd) and win32gui.IsWindowEnabled(hwnd):
-                        class_name = win32gui.GetClassName(hwnd)
-                        window_title = win32gui.GetWindowText(hwnd)
-                        if "Chrome_WidgetWin" in class_name or "Edge_WidgetWin" in class_name:
-                            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                            if pid in our_pids:
-                                found_windows.append((hwnd, class_name, pid, window_title))
-                                logger.debug(f"[窗口排布] 匹配窗口: hwnd={hwnd}, pid={pid}, title={window_title[:30]}...")
-                            else:
-                                logger.debug(f"[窗口排布] 跳过不属于我们的窗口: hwnd={hwnd}, pid={pid}, title={window_title[:30]}...")
-                except Exception as e:
-                    logger.debug(f"查找窗口时出错: {e}")
-            
-            attempt = 0
-            while attempt < max_attempts:
-                attempt += 1
-                found_windows.clear()
-                win32gui.EnumWindows(find_our_browser_windows, None)
-                
-                logger.info(f"[窗口排布] 尝试 {attempt}/{max_attempts}: 找到 {len(found_windows)} 个属于我们的浏览器窗口")
-                
-                if len(found_windows) > 0:
-                    break
-                
-                time.sleep(2)
-            
-            if len(found_windows) > 0:
-                logger.info(f"[窗口排布] ======== 找到的浏览器窗口列表 ========")
-                for idx, (hwnd, class_name, pid, title) in enumerate(found_windows):
-                    logger.info(f"[窗口排布] 窗口 {idx + 1}: hwnd={hwnd}, class={class_name}, pid={pid}, title={title[:50]}...")
-                logger.info(f"[窗口排布] =======================================")
-                
-                target_idx = random.randint(0, len(found_windows) - 1)
-                selected_window = found_windows[target_idx]
-                hwnd = selected_window[0]
-                class_name = selected_window[1]
-                pid = selected_window[2]
-                window_title = selected_window[3]
-                pos_x = 0
-                pos_y = 0
-                
-                logger.info(f"[窗口排布] 随机选择第 {target_idx + 1} 个窗口 (hwnd={hwnd}, pid={pid}, title={window_title[:30]}...)")
-                logger.info(f"[窗口排布] 将窗口移动到左上角: ({pos_x}, {pos_y})")
-                
-                win32gui.SetWindowPos(
-                    hwnd,
-                    win32con.HWND_TOPMOST,
-                    pos_x,
-                    pos_y,
-                    0,
-                    0,
-                    win32con.SWP_SHOWWINDOW | win32con.SWP_NOSIZE
-                )
-                
-                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                
-                try:
-                    win32gui.SetForegroundWindow(hwnd)
-                    win32gui.SetActiveWindow(hwnd)
-                    logger.info(f"[窗口排布] 窗口已移动到左上角、置于顶层并激活")
-                except Exception as e:
-                    logger.warning(f"[窗口排布] 窗口激活失败（Windows安全限制）: {str(e)}")
-                    logger.info(f"[窗口排布] 窗口已移动到左上角并置于顶层")
-                logger.info(f"[窗口排布] 窗口移动完成，验证窗口是否仍然存在...")
-                if win32gui.IsWindow(hwnd):
-                    logger.info(f"[窗口排布] 窗口 {hwnd} 移动后仍然存在")
-                else:
-                    logger.error(f"[窗口排布] 窗口 {hwnd} 移动后不存在了！")
-                
-                logger.info(f"[窗口排布] 再次检查浏览器窗口总数...")
-                found_windows.clear()
-                win32gui.EnumWindows(find_browser_windows, None)
-                logger.info(f"[窗口排布] 移动后剩余 {len(found_windows)} 个浏览器窗口")
-            else:
-                logger.warning(f"[窗口排布] 未找到浏览器窗口，跳过位置调整")
-                
-        except ImportError as e:
-            logger.warning(f"[窗口排布] 无法导入win32gui模块，跳过窗口位置调整: {str(e)}")
-        except Exception as e:
-            logger.error(f"[窗口排布] 调整窗口位置失败: {str(e)}")
-            logger.exception("[窗口排布] 窗口调整错误堆栈:")
     
     def cleanup_chrome_processes(self):
         """清理残留的浏览器进程，但只清理当前使用的浏览器类型"""
@@ -787,22 +854,103 @@ class BrowserManager:
             self.is_starting = True
             
             try:
-                logger.info(f"启动 {len(self.browser_configs)} 个浏览器实例...")
-                # 记录浏览器启动时间
-                self.last_start_time = datetime.now()
-                
-                # 清空之前的进程列表
-                self.browser_processes.clear()
-                
-                for idx, config in enumerate(self.browser_configs):
-                    logger.info(f"打开 {config['name']}: {config['urls']}")
-                    # 每个URL使用单独窗口打开
-                    self.open_urls_in_tabs(idx + 1, config['urls'])
-                    
-                    # 避免同时启动所有实例造成资源冲击
-                    time.sleep(START_DELAY)  # 实例间启动间隔
+                self._start_browsers_internal()
             finally:
                 self.is_starting = False
+    
+    def _start_browsers_internal(self):
+        """内部方法：启动所有配置的浏览器实例（不带锁）"""
+        logger.info(f"启动 {len(self.browser_configs)} 个浏览器实例...")
+        
+        # 启动前清理所有浏览器进程，确保新进程可以正常绑定CDP端口
+        logger.info("启动前清理浏览器进程...")
+        self.cleanup_chrome_processes()
+        time.sleep(2)
+        
+        # 记录浏览器启动时间
+        self.last_start_time = datetime.now()
+        
+        # 清空之前的进程列表
+        self.browser_processes.clear()
+        
+        for idx, config in enumerate(self.browser_configs):
+            logger.info(f"打开 {config['name']}: {config['urls']}")
+            # 每个URL使用单独窗口打开
+            self.open_urls_in_tabs(idx + 1, config['urls'])
+            
+            # 避免同时启动所有实例造成资源冲击
+            time.sleep(START_DELAY)  # 实例间启动间隔
+        
+        # 启动完成后校验页面数量
+        self.validate_and_adjust_page_count()
+    
+    def validate_and_adjust_page_count(self):
+        """校验并调整页面数量，确保与配置一致"""
+        # 计算配置的总URL数量
+        expected_count = sum(len(config.get('urls', [])) for config in self.browser_configs)
+        
+        if expected_count == 0:
+            return
+        
+        # 等待页面启动完成
+        time.sleep(3)
+        
+        # 检查CDP是否可用
+        if not self.is_devtools_ready(silent=True):
+            logger.debug("CDP不可用，跳过页面数量校验")
+            return
+        
+        # 获取当前打开的页面列表
+        targets = self.list_page_targets()
+        
+        # 过滤出实际的页面（排除浏览器默认页面如newtab）
+        current_pages = []
+        default_pages = []
+        for t in targets:
+            if t.get('type') == 'page':
+                url = t.get('url', '')
+                if url.startswith('edge://') or url.startswith('chrome://'):
+                    default_pages.append(t)
+                else:
+                    current_pages.append(t)
+        
+        current_count = len(current_pages)
+        
+        logger.info(f"页面数量校验 - 期望: {expected_count}, 实际: {current_count} (含 {len(default_pages)} 个浏览器默认页面)")
+        
+        # 如果实际数量超过期望数量，关闭多余页面
+        if current_count > expected_count:
+            excess_count = current_count - expected_count
+            logger.warning(f"发现 {excess_count} 个多余页面，正在关闭...")
+            
+            # 按URL过滤，只保留配置中的URL页面
+            configured_urls = set()
+            for config in self.browser_configs:
+                configured_urls.update(config.get('urls', []))
+            
+            # 找出需要关闭的页面（不在配置中的URL）
+            pages_to_close = []
+            for target in current_pages:
+                target_url = target.get('url', '')
+                # 跳过配置中的URL
+                if any(configured_url in target_url for configured_url in configured_urls):
+                    continue
+                pages_to_close.append(target)
+            
+            # 如果没有找到多余的配置外页面，关闭最早打开的页面（最后启动的通常在列表末尾）
+            if not pages_to_close:
+                # 关闭列表末尾的多余页面（最新打开的）
+                pages_to_close = current_pages[-excess_count:]
+            
+            # 关闭多余页面
+            for target in pages_to_close[:excess_count]:
+                target_id = target.get('id')
+                target_url = target.get('url')
+                logger.info(f"关闭多余页面: {target_url}")
+                if self.close_target(target_id):
+                    logger.info(f"成功关闭多余页面: {target_url}")
+                else:
+                    logger.warning(f"关闭多余页面失败: {target_url}")
     
     def scheduled_restart(self):
         """定时重启任务"""
@@ -847,7 +995,7 @@ class BrowserManager:
             logger.error(f"运行过程中出错: {str(e)}")
         finally:
             self.is_running = False
-            self.stop_all_browsers()
+            self.stop_all_browsers(cleanup_residual=True)
             logger.info("浏览器管理器已停止")
 
 def main():
@@ -866,6 +1014,8 @@ def main():
                        help=f'资源监控间隔(秒)，默认{DEFAULT_MONITOR_INTERVAL}秒')
     parser.add_argument('--browser-path', type=str,
                        help='自定义浏览器路径，默认自动检测')
+    parser.add_argument('--group', type=int, default=0,
+                       help='配置组序号（从1开始），默认0表示使用所有配置组')
     
     args = parser.parse_args()
     
@@ -878,6 +1028,7 @@ def main():
     custom_browser_path = args.browser_path
     browser_type = 0  # 默认自动检测
     browser_configs = None
+    selected_group_index = args.group
     
     # 如果配置文件不存在，创建默认配置文件
     if not os.path.exists(args.config):
@@ -889,17 +1040,23 @@ def main():
             "max_memory": 85,
             "monitor_minutes": 1,
             "clean_cache": False,
-            "browsers": [
+            "browser_type": 0,
+            "browser_groups": [
                 {
-                    "name": "默认组1",
+                    "name": "配置1",
                     "urls": [
-                        "https://www.4399.com",
-                        "https://www.acfun.cn",
-                        "https://live.bilibili.com"
+                        "https://live.bilibili.com/1732027424",
+                        "https://live.bilibili.com/1732027424"
+                    ]
+                },
+                {
+                    "name": "配置2",
+                    "urls": [
+                        "https://live.bilibili.com/24568787",
+                        "https://live.bilibili.com/24568787"
                     ]
                 }
-            ],
-            "browser_type": 0
+            ]
         }
         try:
             with open(args.config, 'w', encoding='utf-8') as f:
@@ -934,7 +1091,23 @@ def main():
                 clean_cache_on_exit = config.get('clean_cache', clean_cache_on_exit)
                 custom_browser_path = config.get('browser_path', custom_browser_path)
                 browser_type = config.get('browser_type', 0)
-                browser_configs = config.get('browsers', browser_configs)
+                
+                # 支持新的 browser_groups 字段和旧的 browsers 字段
+                browser_groups = config.get('browser_groups', [])
+                if browser_groups:
+                    browser_configs = browser_groups
+                else:
+                    browser_configs = config.get('browsers', browser_configs)
+                
+                # 如果指定了配置组序号，选择对应的配置组
+                if selected_group_index > 0 and browser_configs:
+                    if selected_group_index <= len(browser_configs):
+                        selected_group = browser_configs[selected_group_index - 1]
+                        browser_configs = [selected_group]
+                        logger.info(f"已选择配置组 {selected_group_index}: {selected_group.get('name', '未知')}")
+                    else:
+                        logger.warning(f"配置组序号 {selected_group_index} 超出范围，共有 {len(browser_configs)} 个配置组")
+                
             logger.info(f"已加载配置文件: {args.config}")
         except json.JSONDecodeError as e:
             logger.error(f"配置文件格式错误（JSON解析失败）: {str(e)}")
